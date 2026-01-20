@@ -58,8 +58,6 @@ if not ENCRYPTION_KEY:
 cipher_suite = Fernet(ENCRYPTION_KEY.encode())
 
 # --- 关键修正：处理数据库连接协议 ---
-# Railway 返回的可能是 postgres:// 也可能是 postgresql://
-# 我们必须将其转换为 postgresql+asyncpg:// 才能使用异步驱动
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
 elif DATABASE_URL.startswith("postgresql://") and not DATABASE_URL.startswith("postgresql+asyncpg://"):
@@ -131,6 +129,7 @@ BTN_SETUP = "⚙️ 设置遗嘱"
 BTN_BIND = "🤝 绑定联系人"
 BTN_SECURITY = "🛡️ 开源验证"
 
+# 修复点：persistent 改为 is_persistent
 MAIN_MENU = ReplyKeyboardMarkup(
     [
         [BTN_SAFE],
@@ -138,7 +137,7 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [BTN_SECURITY]
     ],
     resize_keyboard=True,
-    persistent=True,
+    is_persistent=True,  # <--- 这里修复了参数名
     input_field_placeholder="LifeSignal 正在安全守护中..."
 )
 

@@ -42,9 +42,9 @@ logger = logging.getLogger(__name__)
 # 获取环境变量
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "LifeSignal_Bot") # 用于生成链接
-ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY") # 必须设置，否则重启后无法解密
-GITHUB_REPO_URL = "https://github.com/yourname/lifesignal-bot" # 请修改为您的仓库地址
+BOT_USERNAME = os.getenv("BOT_USERNAME", "LifeSignal_Bot") 
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY") 
+GITHUB_REPO_URL = "https://github.com/yourname/lifesignal-bot" 
 
 # 检查关键变量
 if not TOKEN or not DATABASE_URL:
@@ -52,14 +52,18 @@ if not TOKEN or not DATABASE_URL:
 
 # 处理加密密钥
 if not ENCRYPTION_KEY:
-    logger.warning("⚠️以此模式运行不安全！未检测到 ENCRYPTION_KEY，正在使用临时密钥（重启将导致数据丢失）。")
+    logger.warning("⚠️以此模式运行不安全！未检测到 ENCRYPTION_KEY，正在使用临时密钥。")
     ENCRYPTION_KEY = Fernet.generate_key().decode()
 
 cipher_suite = Fernet(ENCRYPTION_KEY.encode())
 
-# 修正 Railway 数据库连接协议
+# --- 关键修正：处理数据库连接协议 ---
+# Railway 返回的可能是 postgres:// 也可能是 postgresql://
+# 我们必须将其转换为 postgresql+asyncpg:// 才能使用异步驱动
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
+elif DATABASE_URL.startswith("postgresql://") and not DATABASE_URL.startswith("postgresql+asyncpg://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 
 # --- 2. 数据库模型 ---
 Base = declarative_base()
@@ -71,7 +75,7 @@ class User(Base):
     
     # 遗嘱内容 (加密存储)
     will_content = Column(Text, nullable=True) 
-    will_type = Column(String, default='text') # text, photo, video, voice
+    will_type = Column(String, default='text') 
     
     # 紧急联系人
     emergency_contact_id = Column(BigInteger, nullable=True)
@@ -80,7 +84,7 @@ class User(Base):
     # 机制 (单位: 小时)
     check_frequency = Column(Integer, default=72)
     last_active = Column(DateTime(timezone=True), default=func.now())
-    status = Column(String, default='active') # active, inactive
+    status = Column(String, default='active') 
 
 # 异步数据库引擎
 engine = create_async_engine(DATABASE_URL, echo=False)
@@ -151,7 +155,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await get_db_user(session, user.id, user.username)
         await session.commit()
 
-        # 处理联系人绑定请求 (e.g., /start connect_12345)
         if args and args[0].startswith("connect_"):
             target_id = int(args[0].split("_")[1])
             if target_id == user.id:
@@ -164,13 +167,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
             await update.message.reply_text(
                 f"🛡️ **收到委托请求**\n\n用户 ID `{target_id}` 希望将您设为紧急联系人。\n\n"
-                f"**机制说明**：\n只有当系统确认该用户长期失联后，才会解密遗嘱并发送给您。在此之前，您的隐私受到严格保护，您也无法查看其内容。",
+                f"**机制说明**：\n只有当系统确认该用户长期失联后，才会解密遗嘱并发送给您。在此之前，您的隐私受到严格保护。",
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode=ParseMode.MARKDOWN
             )
             return
 
-    # 正常欢迎语
     welcome_text = (
         f"👋 **你好，{user.first_name}**\n\n"
         "欢迎使用 **LifeSignal** —— 您的数字资产安全守护者。\n\n"
@@ -238,7 +240,6 @@ async def setup_freq_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def setup_receive_will(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Step 3: 接收并加密内容"""
     msg = update.message
-    # 防误触退出
     if msg.text and msg.text.startswith(("🟢", "⚙️", "🤝", "🛡️")):
         await msg.reply_text("已保存当前进度并退出。", reply_markup=MAIN_MENU)
         return ConversationHandler.END
@@ -246,7 +247,6 @@ async def setup_receive_will(update: Update, context: ContextTypes.DEFAULT_TYPE)
     content = None
     w_type = 'text'
     
-    # --- 加密核心逻辑 ---
     if msg.text:
         content = encrypt_data(msg.text)
         w_type = 'text'
@@ -256,7 +256,7 @@ async def setup_receive_will(update: Update, context: ContextTypes.DEFAULT_TYPE)
         elif msg.video: raw_file_id = msg.video.file_id
         elif msg.voice: raw_file_id = msg.voice.file_id
         
-        content = encrypt_data(raw_file_id) # 加密文件ID
+        content = encrypt_data(raw_file_id) 
         if msg.photo: w_type = 'photo'
         elif msg.video: w_type = 'video'
         elif msg.voice: w_type = 'voice'
@@ -319,7 +319,6 @@ async def handle_im_safe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await session.commit()
     
     msg = await update.message.reply_text("✅ 已确认！守护倒计时已重置。")
-    # 3秒后自动删除，保持界面清爽
     context.application.create_task(auto_delete_message(context, user.id, msg.message_id))
 
 async def handle_bind_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -373,16 +372,13 @@ async def check_dead_mans_switch(app: Application):
         now = datetime.now(timezone.utc)
         
         for user in users:
-            # 时间计算
             last = user.last_active.replace(tzinfo=timezone.utc) if user.last_active.tzinfo is None else user.last_active
             delta_hours = (now - last).total_seconds() / 3600
             
             if delta_hours > user.check_frequency:
-                # 触发逻辑
                 contact_id = user.emergency_contact_id
                 if contact_id:
                     try:
-                        # 解密
                         decrypted_content = decrypt_data(user.will_content)
                         
                         await app.bot.send_message(
@@ -405,14 +401,12 @@ async def check_dead_mans_switch(app: Application):
                     except Exception as e:
                         logger.error(f"发送遗嘱失败: {e}")
                 else:
-                    user.status = 'inactive' # 无联系人也停止，避免死循环
+                    user.status = 'inactive'
                     session.add(user)
             
-            # 80% 预警
             elif delta_hours > (user.check_frequency * 0.8):
                 try:
                     left_hours = int(user.check_frequency - delta_hours)
-                    # 避免频繁骚扰，可以加一个 last_warning_time 字段判断，此处简化直接发
                     await app.bot.send_message(
                         chat_id=user.chat_id,
                         text=f"⏰ **温馨提醒**\n\n您已有一段时间未活动。请点击“🟢 我很安全”重置计时。\n距离触发还剩约 {left_hours} 小时。",
@@ -430,11 +424,9 @@ async def init_db():
         await conn.run_sync(Base.metadata.create_all)
 
 def main():
-    # 使用 PicklePersistence 防止重启丢失对话状态
     persistence = PicklePersistence(filepath='persistence.pickle')
     app = Application.builder().token(TOKEN).persistence(persistence).build()
 
-    # 设置流程 Handler
     setup_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(f"^{BTN_SETUP}$"), setup_start)],
         states={
@@ -446,7 +438,6 @@ def main():
         name="setup_conversation", persistent=True
     )
 
-    # 注册 Handler
     app.add_handler(CommandHandler("start", start))
     app.add_handler(setup_conv)
     app.add_handler(MessageHandler(filters.Regex(f"^{BTN_SAFE}$"), handle_im_safe))
@@ -455,11 +446,9 @@ def main():
     app.add_handler(CallbackQueryHandler(confirm_bind_callback, pattern="^accept_bind_"))
     app.add_handler(CallbackQueryHandler(confirm_bind_callback, pattern="^decline_bind"))
 
-    # 初始化 DB
     loop = asyncio.get_event_loop()
     loop.run_until_complete(init_db())
     
-    # 启动定时任务
     scheduler = AsyncIOScheduler()
     scheduler.add_job(check_dead_mans_switch, 'interval', hours=1, args=[app])
     scheduler.start()

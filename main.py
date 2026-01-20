@@ -106,8 +106,11 @@ def decrypt_data(encrypted_data: str) -> str:
     except Exception:
         return "[数据无法解密：密钥可能已更改]"
 
-async def auto_delete_message(context, chat_id, message_id, delay=3):
-    """消息自动销毁"""
+async def auto_delete_message(context, chat_id, message_id, delay=1):
+    """
+    消息自动销毁
+    默认 1 秒后删除用户发送的指令消息，保持界面像 APP 一样干净
+    """
     await asyncio.sleep(delay)
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
@@ -126,16 +129,16 @@ async def get_db_user(session, chat_id, username=None):
         user.username = username
     return user
 
-# --- 4. UI 界面定义 (全局常量定义区) ---
+# --- 4. UI 界面定义 ---
 
-# ✅ 定义在最外层，保证全局可见，修复 NameError
+# 全局常量
 BTN_SAFE = "🟢 我很安全"
 BTN_BIND = "🤝 绑定联系人"
 BTN_SECURITY = "🛡️ 开源验证"
 
 def get_main_menu(user_obj) -> ReplyKeyboardMarkup:
     """
-    生成底部常驻菜单
+    生成底部常驻菜单。
     """
     if user_obj and user_obj.will_content:
         btn_setup = "⚙️ 设置/重置遗嘱"
@@ -162,6 +165,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     args = context.args
     
+    # start 命令本身也可以稍后删除，保持极致干净（可选，这里设为10秒）
+    context.application.create_task(auto_delete_message(context, user.id, update.message.message_id, delay=10))
+
     async with AsyncSessionLocal() as session:
         db_user = await get_db_user(session, user.id, user.username)
         await session.commit()
@@ -192,13 +198,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "我们提供银行级的安全保障，确保在不可预见的情况下，您的重要信息能安全地传递给信任的人。\n\n"
         "🛡️ **安全承诺**：\n"
         "• **代码开源**：核心逻辑公开透明，接受社区审计。\n"
-        "• **AES 加密**：所有遗嘱内容均经过高强度加密存储。\n\n"
+        "• **AES 加密**：所有遗嘱内容均经过高强度加密存储。\n"
+        "• **痕迹清理**：交互记录自动销毁，防止隐私泄露。\n\n"
         "👇 **请点击下方按钮开始使用：**"
     )
+    # 欢迎语保留，作为 Landing Page
     await update.message.reply_markdown(welcome_text, reply_markup=menu_markup)
 
 async def handle_security(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """开源验证"""
+    # 🧹 立即删除用户点击的按钮文字消息
+    context.application.create_task(auto_delete_message(context, update.effective_chat.id, update.message.message_id, delay=1))
+
     text = (
         "🛡️ **透明是信任的基石**\n\n"
         "**死了么LifeSignal** 致力于提供最安全的数字遗嘱服务。为了证明这一点，我们将项目代码完全开源。\n\n"
@@ -214,9 +225,12 @@ async def handle_security(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_markdown(text, reply_markup=InlineKeyboardMarkup(keyboard), disable_web_page_preview=True)
 
-# --- 遗嘱设置流程 ---
+# --- 遗嘱设置流程 (隐私保护重点) ---
 
 async def setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # 🧹 立即删除用户点击的“设置遗嘱”按钮消息
+    context.application.create_task(auto_delete_message(context, update.effective_chat.id, update.message.message_id, delay=1))
+
     user_id = update.effective_user.id
     async with AsyncSessionLocal() as session:
         user = await get_db_user(session, user_id)
@@ -245,7 +259,9 @@ async def setup_overwrite_decision(update: Update, context: ContextTypes.DEFAULT
         async with AsyncSessionLocal() as session:
             db_user = await get_db_user(session, user_id)
             markup = get_main_menu(db_user)
-        await query.message.reply_text("✅ 操作已取消。", reply_markup=markup)
+        # 提示后也删除提示本身，保持干净
+        msg = await query.message.reply_text("✅ 操作已取消。", reply_markup=markup)
+        context.application.create_task(auto_delete_message(context, user_id, msg.message_id, delay=5))
         return ConversationHandler.END
     
     if query.data == "overwrite_yes":
@@ -275,21 +291,29 @@ async def setup_freq_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     info_text = (
         "📝 **步骤 2/2：录入遗嘱内容**\n\n"
         "请直接发送您希望留下的文字、图片或视频。\n\n"
-        "🔒 **加密保护已启动**\n"
-        "您发送的内容将立即被加密。您可以放心地存储重要信息（如账户线索、备忘录等）。"
+        "🔐 **隐私保护启动**\n"
+        "您发送的内容将被加密存储，并且**消息记录将在 15 秒后自动销毁**，请放心发送。"
     )
     await context.bot.send_message(chat_id=update.effective_chat.id, text=info_text, parse_mode=ParseMode.MARKDOWN)
     return STATE_UPLOAD_WILL
 
 async def setup_receive_will(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
+    
+    # 🔒 安全核心：立即启动该消息的自毁程序 (15秒)
+    context.application.create_task(auto_delete_message(context, update.effective_chat.id, msg.message_id, delay=15))
+
     # 防误触逻辑
     if msg.text and msg.text.startswith(("🟢", "⚙️", "🤝", "🛡️")):
         user_id = update.effective_user.id
         async with AsyncSessionLocal() as session:
             db_user = await get_db_user(session, user_id)
             markup = get_main_menu(db_user)
-        await msg.reply_text("已保存当前进度并退出。", reply_markup=markup)
+        # 清理用户刚才点的按钮文字
+        context.application.create_task(auto_delete_message(context, user_id, msg.message_id, delay=1))
+        
+        warn_msg = await msg.reply_text("已保存当前进度并退出。", reply_markup=markup)
+        context.application.create_task(auto_delete_message(context, user_id, warn_msg.message_id, delay=5))
         return ConversationHandler.END
 
     content = None
@@ -307,7 +331,8 @@ async def setup_receive_will(update: Update, context: ContextTypes.DEFAULT_TYPE)
         elif msg.video: w_type = 'video'
         elif msg.voice: w_type = 'voice'
     else:
-        await msg.reply_text("暂不支持该格式，请发送文字或媒体文件。")
+        error_msg = await msg.reply_text("暂不支持该格式，请发送文字或媒体文件。")
+        context.application.create_task(auto_delete_message(context, update.effective_chat.id, error_msg.message_id, delay=5))
         return STATE_UPLOAD_WILL
 
     context.user_data.update({'temp_content': content, 'temp_type': w_type})
@@ -315,7 +340,7 @@ async def setup_receive_will(update: Update, context: ContextTypes.DEFAULT_TYPE)
         InlineKeyboardButton("✅ 确认加密保存", callback_data="confirm_yes"),
         InlineKeyboardButton("🔄 重新编辑", callback_data="confirm_retry")
     ]]
-    await msg.reply_text("🔒 内容已加密，确认保存吗？", reply_markup=InlineKeyboardMarkup(keyboard))
+    await msg.reply_text("🔒 内容已加密，原始消息将于 15 秒后销毁。确认保存吗？", reply_markup=InlineKeyboardMarkup(keyboard))
     return STATE_CONFIRM
 
 async def setup_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -353,16 +378,25 @@ async def setup_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    # 🧹 删除“取消”指令
+    context.application.create_task(auto_delete_message(context, user_id, update.message.message_id, delay=1))
+    
     async with AsyncSessionLocal() as session:
         user = await get_db_user(session, user_id)
         markup = get_main_menu(user)
-    await update.message.reply_text("操作已取消。", reply_markup=markup)
+    
+    msg = await update.message.reply_text("操作已取消。", reply_markup=markup)
+    context.application.create_task(auto_delete_message(context, user_id, msg.message_id, delay=3))
     return ConversationHandler.END
 
-# --- 报平安逻辑 ---
+# --- 报平安逻辑 (清理痕迹) ---
 
 async def handle_im_safe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    
+    # 🧹 立即删除用户点击的“🟢 我很安全”
+    context.application.create_task(auto_delete_message(context, user.id, update.message.message_id, delay=1))
+
     async with AsyncSessionLocal() as session:
         db_user = await get_db_user(session, user.id)
         markup = get_main_menu(db_user)
@@ -380,22 +414,25 @@ async def handle_im_safe(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "如果现在发生意外，**系统将无法执行任何操作**。\n"
                 "请务必完成下方设置 👇"
             )
-            await update.message.reply_text(alert_text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+            warn_msg = await update.message.reply_text(alert_text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+            context.application.create_task(auto_delete_message(context, user.id, warn_msg.message_id, delay=30))
             return
 
         db_user.last_active = datetime.now(timezone.utc)
         db_user.status = 'active'
         await session.commit()
     
-    msg = await update.message.reply_text("✅ 已确认！守护倒计时已重置。", reply_markup=markup)
-    context.application.create_task(auto_delete_message(context, user.id, msg.message_id))
+    # 🔒 隐私：Bot 的确认回复也将在 15 秒后删除
+    reply_msg = await update.message.reply_text("✅ 已确认！守护倒计时已重置。", reply_markup=markup)
+    context.application.create_task(auto_delete_message(context, user.id, reply_msg.message_id, delay=15))
 
-# --- 绑定与内联邀请逻辑 (核心升级) ---
+# --- 绑定与内联邀请逻辑 ---
 
 async def handle_bind_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """引导使用内联模式发送"""
-    # 这里我们使用 switch_inline_query 参数
-    # 用户点击后，输入框会自动填入 @BotName invite
+    # 🧹 立即删除用户点击的“🤝 绑定联系人”
+    context.application.create_task(auto_delete_message(context, update.effective_chat.id, update.message.message_id, delay=1))
+
     keyboard = [[
         InlineKeyboardButton("🚀 选择好友发送邀请", switch_inline_query="invite")
     ]]
@@ -534,7 +571,6 @@ def main():
             STATE_UPLOAD_WILL: [MessageHandler(filters.ALL & ~filters.COMMAND & ~filters.Regex("^(🟢|⚙️|🤝|🛡️)"), setup_receive_will)],
             STATE_CONFIRM: [CallbackQueryHandler(setup_confirm, pattern="^confirm_")]
         },
-        # ✅ 正确使用全局变量 BTN_SAFE
         fallbacks=[CommandHandler("cancel", cancel_setup), MessageHandler(filters.Regex(f"^{BTN_SAFE}$"), cancel_setup)],
         name="setup_conversation", persistent=True
     )
@@ -547,7 +583,6 @@ def main():
     app.add_handler(CallbackQueryHandler(confirm_bind_callback, pattern="^accept_bind_"))
     app.add_handler(CallbackQueryHandler(confirm_bind_callback, pattern="^decline_bind"))
     
-    # ✅ 注册内联处理器
     app.add_handler(InlineQueryHandler(inline_query_handler))
 
     loop = asyncio.get_event_loop()

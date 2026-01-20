@@ -44,7 +44,8 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "LifeSignal_Bot") 
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY") 
-GITHUB_REPO_URL = "https://github.com/yourname/lifesignal-bot" 
+# ✅ 更新项目地址
+GITHUB_REPO_URL = "https://github.com/ShiXinqiang/LifeSignal-Trust-Edition-" 
 
 # 检查关键变量
 if not TOKEN or not DATABASE_URL:
@@ -57,7 +58,7 @@ if not ENCRYPTION_KEY:
 
 cipher_suite = Fernet(ENCRYPTION_KEY.encode())
 
-# --- 关键修正：处理数据库连接协议 ---
+# 修正 Railway 数据库连接协议
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
 elif DATABASE_URL.startswith("postgresql://") and not DATABASE_URL.startswith("postgresql+asyncpg://"):
@@ -124,12 +125,12 @@ async def get_db_user(session, chat_id, username=None):
     return user
 
 # --- 4. UI 界面定义 ---
+# ✅ 文案更新
 BTN_SAFE = "🟢 我很安全"
-BTN_SETUP = "⚙️ 设置遗嘱"
+BTN_SETUP = "⚙️ 设置/重置遗嘱"
 BTN_BIND = "🤝 绑定联系人"
 BTN_SECURITY = "🛡️ 开源验证"
 
-# 修复点：persistent 改为 is_persistent
 MAIN_MENU = ReplyKeyboardMarkup(
     [
         [BTN_SAFE],
@@ -137,11 +138,12 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [BTN_SECURITY]
     ],
     resize_keyboard=True,
-    is_persistent=True,  # <--- 这里修复了参数名
-    input_field_placeholder="LifeSignal 正在安全守护中..."
+    is_persistent=True,
+    input_field_placeholder="死了么LifeSignal 正在守护..."
 )
 
-STATE_CHOOSE_FREQ, STATE_UPLOAD_WILL, STATE_CONFIRM = range(3)
+# ✅ 新增一个状态 STATE_CHECK_EXISTING
+STATE_CHECK_EXISTING, STATE_CHOOSE_FREQ, STATE_UPLOAD_WILL, STATE_CONFIRM = range(4)
 
 # --- 5. 交互逻辑 ---
 
@@ -172,9 +174,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+    # ✅ 文案更新
     welcome_text = (
         f"👋 **你好，{user.first_name}**\n\n"
-        "欢迎使用 **LifeSignal** —— 您的数字资产安全守护者。\n\n"
+        "欢迎使用 **死了么LifeSignal** —— 您的数字资产安全守护者。\n\n"
         "我们提供银行级的安全保障，确保在不可预见的情况下，您的重要信息能安全地传递给信任的人。\n\n"
         "🛡️ **安全承诺**：\n"
         "• **代码开源**：核心逻辑公开透明，接受社区审计。\n"
@@ -185,9 +188,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_security(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理 '🛡️ 开源验证'"""
+    # ✅ 文案更新
     text = (
         "🛡️ **透明是信任的基石**\n\n"
-        "LifeSignal 致力于提供最安全的数字遗嘱服务。为了证明这一点，我们将项目代码完全开源。\n\n"
+        "**死了么LifeSignal** 致力于提供最安全的数字遗嘱服务。为了证明这一点，我们将项目代码完全开源。\n\n"
         "您可以通过以下方式验证我们的安全性：\n"
         "1. **代码审计**：点击下方按钮查看 GitHub 源码，每一行逻辑都清晰可见。\n"
         "2. **链接检测**：您可以使用第三方工具检测我们的服务链接，确保无恶意行为。\n\n"
@@ -203,17 +207,58 @@ async def handle_security(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- 遗嘱设置流程 (Conversation) ---
 
 async def setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 1: 选择时间"""
+    """Step 0: 检查是否存在旧遗嘱"""
+    user_id = update.effective_user.id
+    
+    async with AsyncSessionLocal() as session:
+        user = await get_db_user(session, user_id)
+        has_will = bool(user.will_content)
+    
+    # ✅ 优化：如果已有遗嘱，弹出警告，防止误操作覆盖
+    if has_will:
+        keyboard = [
+            [InlineKeyboardButton("⚠️ 覆盖并重新设置", callback_data="overwrite_yes")],
+            [InlineKeyboardButton("🚫 取消，保留原状", callback_data="overwrite_no")]
+        ]
+        await update.message.reply_text(
+            "⚠️ **检测到您已设置过遗嘱**\n\n"
+            "继续操作将导致**旧的遗嘱内容被永久删除**且无法恢复。\n\n"
+            "您确定要重新设置吗？",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return STATE_CHECK_EXISTING
+    else:
+        # 如果是新用户，直接跳到时间选择
+        return await ask_frequency_step(update, context)
+
+async def setup_overwrite_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 0.5: 处理覆盖决策"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "overwrite_no":
+        await query.edit_message_text("✅ 操作已取消，您的旧遗嘱非常安全。")
+        return ConversationHandler.END
+    
+    if query.data == "overwrite_yes":
+        # 用户确认覆盖，进入下一步
+        return await ask_frequency_step(update, context, is_callback=True)
+
+async def ask_frequency_step(update: Update, context: ContextTypes.DEFAULT_TYPE, is_callback=False):
+    """辅助函数：发送频率选择卡片"""
     keyboard = [[
         InlineKeyboardButton("1 天", callback_data="day_1"),
         InlineKeyboardButton("3 天 (推荐)", callback_data="day_3"),
         InlineKeyboardButton("7 天", callback_data="day_7"),
     ]]
-    await update.message.reply_text(
-        "⚙️ **步骤 1/2：选择确认周期**\n\n请问如果我联系不上您超过多少**天**，就视为触发条件？", 
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.MARKDOWN
-    )
+    text = "⚙️ **步骤 1/2：选择确认周期**\n\n请问如果我联系不上您超过多少**天**，就视为触发条件？"
+    
+    if is_callback:
+        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+        
     return STATE_CHOOSE_FREQ
 
 async def setup_freq_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -331,7 +376,8 @@ async def handle_bind_request(update: Update, context: ContextTypes.DEFAULT_TYPE
         "请将下方的卡片转发给您信任的人（如亲属、好友）。\n"
         "对方点击接受后，将获得在紧急情况下接收您信息的权限。"
     )
-    card = f"📩 **来自 {user.first_name} 的信任委托**\n\n我正在使用 LifeSignal 服务，希望将你设为我的紧急联系人。\n👉 [点击确认接受委托]({invite_link})"
+    # ✅ 文案更新
+    card = f"📩 **来自 {user.first_name} 的信任委托**\n\n我正在使用 死了么LifeSignal 服务，希望将你设为我的紧急联系人。\n👉 [点击确认接受委托]({invite_link})"
     
     await update.message.reply_markdown(text, reply_markup=MAIN_MENU)
     await update.message.reply_markdown(card)
@@ -380,9 +426,10 @@ async def check_dead_mans_switch(app: Application):
                     try:
                         decrypted_content = decrypt_data(user.will_content)
                         
+                        # ✅ 文案更新
                         await app.bot.send_message(
                             chat_id=contact_id,
-                            text=f"🚨 **LifeSignal 紧急触发**\n\n用户 @{user.username or user.chat_id} 已超过设定时间未报平安。\n以下是解密后的信息：",
+                            text=f"🚨 **死了么LifeSignal 紧急触发**\n\n用户 @{user.username or user.chat_id} 已超过设定时间未报平安。\n以下是解密后的信息：",
                             parse_mode=ParseMode.MARKDOWN
                         )
                         
@@ -429,6 +476,8 @@ def main():
     setup_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(f"^{BTN_SETUP}$"), setup_start)],
         states={
+            # ✅ 新增：覆盖检查状态
+            STATE_CHECK_EXISTING: [CallbackQueryHandler(setup_overwrite_decision, pattern="^overwrite_")],
             STATE_CHOOSE_FREQ: [CallbackQueryHandler(setup_freq_chosen, pattern="^day_")],
             STATE_UPLOAD_WILL: [MessageHandler(filters.ALL & ~filters.COMMAND & ~filters.Regex("^(🟢|⚙️|🤝|🛡️)"), setup_receive_will)],
             STATE_CONFIRM: [CallbackQueryHandler(setup_confirm, pattern="^confirm_")]
@@ -452,7 +501,7 @@ def main():
     scheduler.add_job(check_dead_mans_switch, 'interval', hours=1, args=[app])
     scheduler.start()
     
-    print("🚀 LifeSignal Bot (Trust Edition) is running...")
+    print("🚀 死了么LifeSignal Bot is running...")
     app.run_polling()
 
 if __name__ == '__main__':

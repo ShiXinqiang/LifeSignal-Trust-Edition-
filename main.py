@@ -125,33 +125,31 @@ async def get_db_user(session, chat_id, username=None):
         user.username = username
     return user
 
-# --- 4. 动态 UI 界面定义 (UX 核心升级) ---
+# --- 4. UI 界面定义 (修复点：恢复全局常量) ---
+
+# ✅ 这里定义全局常量，确保 main() 函数能读取到
+BTN_SAFE = "🟢 我很安全"
+BTN_BIND = "🤝 绑定联系人"
+BTN_SECURITY = "🛡️ 开源验证"
 
 def get_main_menu(user_obj) -> ReplyKeyboardMarkup:
     """
     根据用户状态动态生成键盘文字
-    - 如果没有遗嘱 -> 显示“设置遗嘱”
-    - 如果已有遗嘱 -> 显示“设置/重置遗嘱”
     """
-    btn_safe = "🟢 我很安全"
-    
     # 动态判断按钮文字
     if user_obj and user_obj.will_content:
         btn_setup = "⚙️ 设置/重置遗嘱"
     else:
         btn_setup = "⚙️ 设置遗嘱"
         
-    btn_bind = "🤝 绑定联系人"
-    btn_security = "🛡️ 开源验证"
-
     return ReplyKeyboardMarkup(
         [
-            [btn_safe],
-            [btn_setup, btn_bind],
-            [btn_security]
+            [BTN_SAFE],
+            [btn_setup, BTN_BIND],
+            [BTN_SECURITY]
         ],
         resize_keyboard=True,
-        is_persistent=True, # 保持键盘常驻
+        is_persistent=True, 
         input_field_placeholder="死了么LifeSignal 正在守护..."
     )
 
@@ -189,7 +187,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    # 正常欢迎语
     welcome_text = (
         f"👋 **你好，{user.first_name}**\n\n"
         "欢迎使用 **死了么LifeSignal** —— 您的数字资产安全守护者。\n\n"
@@ -298,8 +295,8 @@ async def setup_receive_will(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Step 3: 接收并加密内容"""
     msg = update.message
     # 防误触：检测到底部菜单文字直接退出
+    # 这里使用 regex pattern 匹配所有可能的按钮开头
     if msg.text and msg.text.startswith(("🟢", "⚙️", "🤝", "🛡️")):
-        # 获取最新的菜单状态再发送，确保文字正确
         user_id = update.effective_user.id
         async with AsyncSessionLocal() as session:
             db_user = await get_db_user(session, user_id)
@@ -355,10 +352,8 @@ async def setup_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user.will_type = d['temp_type']
         user.last_active = datetime.now(timezone.utc)
         await session.commit()
-        # 重新获取用户以生成最新菜单
         updated_user = await get_db_user(session, user_id)
         has_contact = bool(updated_user.emergency_contact_id)
-        # 获取动态菜单（此时应该显示“设置/重置遗嘱”）
         new_menu = get_main_menu(updated_user)
 
     msg = "✅ **设置成功！您的数据已安全存储。**\n"
@@ -367,7 +362,6 @@ async def setup_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN)
     
-    # 发送新的动态键盘
     if not has_contact:
         await context.bot.send_message(chat_id=user_id, text="👇 建议立即绑定", reply_markup=new_menu)
     else:
@@ -383,7 +377,7 @@ async def cancel_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("操作已取消。", reply_markup=markup)
     return ConversationHandler.END
 
-# --- 常规功能 (优化版) ---
+# --- 常规功能 ---
 
 async def handle_im_safe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """报平安 - 智能状态检测"""
@@ -392,7 +386,7 @@ async def handle_im_safe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with AsyncSessionLocal() as session:
         db_user = await get_db_user(session, user.id)
         
-        # 🚨 状态检测：如果是“裸奔”用户，拦截并警告
+        # 🚨 状态检测
         if not db_user.will_content or not db_user.emergency_contact_id:
             missing = []
             if not db_user.will_content: missing.append("未设置遗嘱")
@@ -405,16 +399,13 @@ async def handle_im_safe(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "如果现在发生意外，**系统将无法执行任何操作**。\n"
                 "请务必完成下方设置 👇"
             )
-            # 刷新键盘确保显示正确
             markup = get_main_menu(db_user)
             await update.message.reply_text(alert_text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
             return
 
-        # 正常流程：重置时间
         db_user.last_active = datetime.now(timezone.utc)
         db_user.status = 'active'
         await session.commit()
-        # 刷新键盘（保持同步）
         markup = get_main_menu(db_user)
     
     msg = await update.message.reply_text("✅ 已确认！守护倒计时已重置。", reply_markup=markup)
@@ -427,7 +418,6 @@ async def handle_bind_request(update: Update, context: ContextTypes.DEFAULT_TYPE
     invite_link = f"https://t.me/{bot_username}?start=connect_{user.id}"
     
     # 构造 Telegram 原生分享链接
-    # 格式: https://t.me/share/url?url={link}&text={text}
     share_text = f"📩 来自 {user.first_name} 的信任委托\n我正在使用 死了么LifeSignal 服务，希望将你设为我的紧急联系人。"
     encoded_text = urllib.parse.quote(share_text)
     encoded_url = urllib.parse.quote(invite_link)
@@ -439,7 +429,6 @@ async def handle_bind_request(update: Update, context: ContextTypes.DEFAULT_TYPE
         "👇 **点击下方按钮，直接选择好友发送邀请：**"
     )
     
-    # ✅ 极致 UX：一键转发按钮
     keyboard = [[InlineKeyboardButton("🚀 一键转发给联系人", url=share_deep_link)]]
     
     await update.message.reply_markdown(text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -514,7 +503,6 @@ async def check_dead_mans_switch(app: Application):
             elif delta_hours > (user.check_frequency * 0.8):
                 try:
                     left_hours = int(user.check_frequency - delta_hours)
-                    # 此时也刷新一下键盘，确保用户看到的是最新的
                     markup = get_main_menu(user)
                     await app.bot.send_message(
                         chat_id=user.chat_id,
@@ -545,6 +533,7 @@ def main():
             STATE_UPLOAD_WILL: [MessageHandler(filters.ALL & ~filters.COMMAND & ~filters.Regex("^(🟢|⚙️|🤝|🛡️)"), setup_receive_will)],
             STATE_CONFIRM: [CallbackQueryHandler(setup_confirm, pattern="^confirm_")]
         },
+        # ✅ 这里现在可以正常读取全局的 BTN_SAFE 了
         fallbacks=[CommandHandler("cancel", cancel_setup), MessageHandler(filters.Regex(f"^{BTN_SAFE}$"), cancel_setup)],
         name="setup_conversation", persistent=True
     )

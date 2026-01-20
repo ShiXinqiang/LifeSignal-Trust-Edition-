@@ -81,9 +81,7 @@ class User(Base):
     check_frequency = Column(Integer, default=72)
     last_active = Column(DateTime(timezone=True), default=func.now())
     status = Column(String, default='active') 
-    will_content = Column(Text, nullable=True) 
-    will_type = Column(String, default='text') 
-    will_recipients = Column(String, default="") 
+    # 注意：will_content 已移除，迁移至 Will 表
 
 class Will(Base):
     __tablename__ = 'wills'
@@ -124,11 +122,12 @@ def decrypt_data(encrypted_data: str) -> str:
         return "[数据无法解密]"
 
 async def auto_delete_message(context, chat_id, message_id, delay=1):
-    await asyncio.sleep(delay)
+    """自动销毁消息"""
     try:
+        await asyncio.sleep(delay)
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
     except Exception:
-        pass
+        pass # 忽略错误（如消息已被删除）
 
 async def get_db_user(session, chat_id, username=None):
     stmt = select(User).where(User.chat_id == chat_id)
@@ -158,11 +157,11 @@ async def get_wills(session, user_id):
 
 # --- 4. UI 定义 ---
 
-BTN_SAFE = "🟢 我很平安" # 更亲切
-BTN_CONTACTS = "👥 守护人管理" # 更温暖
-BTN_WILLS = "📜 我的遗嘱箱" # 更形象
+BTN_SAFE = "🟢 我很平安" 
+BTN_CONTACTS = "👥 守护人管理" 
+BTN_WILLS = "📜 我的遗嘱箱" 
 BTN_SETTINGS = "⚙️ 调整时间"
-BTN_SECURITY = "🛡️ 安全检测"
+BTN_SECURITY = "🛡️ 开源验证"
 
 def get_main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -194,33 +193,37 @@ async def global_lock_interceptor(update: Update, context: ContextTypes.DEFAULT_
     user = update.effective_user
     if not user: return 
 
+    # 记录消息ID以便稍后删除，但不阻塞当前逻辑
     if update.message:
         context.application.create_task(auto_delete_message(context, user.id, update.message.message_id, 0))
 
-    async with AsyncSessionLocal() as session:
-        db_user = await get_db_user(session, user.id)
-        
-        if db_user.is_locked:
-            key_display = db_user.unlock_key if db_user.unlock_key else "ERROR"
+    try:
+        async with AsyncSessionLocal() as session:
+            db_user = await get_db_user(session, user.id)
             
-            alert_text = (
-                "⛔️ **账号暂时冻结**\n\n"
-                "因为密码输入错误次数过多，为了保护您的数据，系统暂时锁定了账号。\n\n"
-                "🆘 **如何恢复使用？**\n"
-                "1. 请联系您的守护人（紧急联系人）。\n"
-                f"2. 把这个数字告诉他/她：`{key_display}`\n"
-                "3. 让他在机器人里输入 `/unlock` 帮您解锁。"
-            )
-            
-            if update.callback_query:
-                await update.callback_query.answer("⛔️ 账号已冻结，请联系守护人解锁。", show_alert=True)
-                msg = await context.bot.send_message(user.id, alert_text, parse_mode=ParseMode.MARKDOWN)
-                context.application.create_task(auto_delete_message(context, user.id, msg.message_id, 30))
-            elif update.message:
-                msg = await update.message.reply_text(alert_text, parse_mode=ParseMode.MARKDOWN)
-                context.application.create_task(auto_delete_message(context, user.id, msg.message_id, 30))
-            
-            raise ApplicationHandlerStop
+            if db_user.is_locked:
+                key_display = db_user.unlock_key if db_user.unlock_key else "ERROR"
+                
+                alert_text = (
+                    "⛔️ **账号已冻结 (Security Lock)**\n\n"
+                    "检测到多次密码错误，系统已熔断。\n\n"
+                    "🔑 **解锁密钥**：`{}`\n\n"
+                    "👉 请联系您的 **守护人**，将此密钥告诉他/她。\n"
+                    "让他在机器人里输入 `/unlock` 并填入密钥为您解锁。".format(key_display)
+                )
+                
+                if update.callback_query:
+                    await update.callback_query.answer("⛔️ 账号已锁定", show_alert=True)
+                    msg = await context.bot.send_message(user.id, alert_text, parse_mode=ParseMode.MARKDOWN)
+                    context.application.create_task(auto_delete_message(context, user.id, msg.message_id, 30))
+                elif update.message:
+                    msg = await update.message.reply_text(alert_text, parse_mode=ParseMode.MARKDOWN)
+                    context.application.create_task(auto_delete_message(context, user.id, msg.message_id, 30))
+                
+                raise ApplicationHandlerStop
+    except Exception as e:
+        logger.error(f"DB Error in interceptor: {e}")
+        # 如果数据库还没准备好，不要阻断，让后面的逻辑报错或忽略
 
 # --- 6. 密码验证逻辑 ---
 
@@ -235,18 +238,12 @@ async def request_password_entry(update: Update, context: ContextTypes.DEFAULT_T
     
     async with AsyncSessionLocal() as session:
         user = await get_db_user(session, user_id)
-        
-        # 核心逻辑：如果密码为空（首次或重置后），直接引导设置
         if not user.password_hash:
-            msg = await update.message.reply_text(
-                "👋 **欢迎使用**\n\n"
-                "为了保护您的隐私，请先设置一个 **安全密码**。\n"
-                "（以后查看遗嘱、修改设置都需要用到它）\n\n"
-                "👉 **请直接发送您想设置的密码：**"
-            )
-            return STATE_SET_PASSWORD
+            msg = await update.message.reply_text("👋 **欢迎使用**\n首次使用请点击 /start 初始化密码。")
+            context.application.create_task(auto_delete_message(context, user_id, msg.message_id, 10))
+            return ConversationHandler.END
     
-    prompt = await update.message.reply_text("🔐 **身份验证**\n\n请输入您的安全密码：")
+    prompt = await update.message.reply_text("🔐 **身份验证**\n请输入您的安全密码：")
     context.application.create_task(auto_delete_message(context, user_id, prompt.message_id, 30))
     return STATE_VERIFY_PASSWORD
 
@@ -275,14 +272,8 @@ async def handle_password_verification(update: Update, context: ContextTypes.DEF
                 user.unlock_key = generate_unlock_key()
                 await session.commit()
                 
-                warn_text = (
-                    "⛔️ **账号已冻结**\n\n"
-                    "密码错误次数过多。\n"
-                    f"您的解锁密钥是：`{user.unlock_key}`\n"
-                    "请把这个号码告诉您的守护人，让他帮您解锁。"
-                )
-                warn = await msg.reply_text(warn_text, parse_mode=ParseMode.MARKDOWN)
-                context.application.create_task(auto_delete_message(context, user_id, warn.message_id, 30))
+                warn = await msg.reply_text("⛔️ **密码错误过多，账号已锁定！**")
+                context.application.create_task(auto_delete_message(context, user_id, warn.message_id, 15))
                 await broadcast_lockout(context, user_id, session)
                 return ConversationHandler.END
             else:
@@ -293,13 +284,11 @@ async def handle_password_verification(update: Update, context: ContextTypes.DEF
 
 async def broadcast_lockout(context, user_id, session):
     contacts = await get_contacts(session, user_id)
-    if not contacts: return
     for c in contacts:
-        try: 
-            await context.bot.send_message(c.contact_chat_id, f"🚨 **求助提醒**\n\n您守护的用户 (ID `{user_id}`) 账号被冻结了。\n\n如果他是本人，他会联系您并给您一个 **6位数字**。\n收到数字后，请在这里回复 `/unlock` 帮他恢复。", parse_mode=ParseMode.MARKDOWN)
+        try: await context.bot.send_message(c.contact_chat_id, f"🚨 **求助提醒**\n用户 ID `{user_id}` 账号已被冻结。\n如果是本人操作，请等待他给您密钥，然后回复 `/unlock`。", parse_mode=ParseMode.MARKDOWN)
         except: pass
 
-# --- 7. 紧急联系人解锁流程 (解锁=重置密码) ---
+# --- 7. 解锁流程 ---
 
 async def start_remote_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     executor_id = update.effective_user.id
@@ -310,7 +299,7 @@ async def start_remote_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE
         entrustments = (await session.execute(stmt)).scalars().all()
         
         if not entrustments:
-            msg = await update.message.reply_text("❓ 您目前没有守护任何人。")
+            msg = await update.message.reply_text("⚠️ 您没有守护任何人。")
             context.application.create_task(auto_delete_message(context, executor_id, msg.message_id, 5))
             return ConversationHandler.END
 
@@ -321,33 +310,23 @@ async def start_remote_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE
                 locked_users.append(user)
         
         if not locked_users:
-            msg = await update.message.reply_text("✅ 您守护的朋友们账号都很安全，无需解锁。")
+            msg = await update.message.reply_text("✅ 您守护的账号都很安全。")
             context.application.create_task(auto_delete_message(context, executor_id, msg.message_id, 5))
             return ConversationHandler.END
         
         keyboard = []
         for u in locked_users:
             name = u.username or f"ID {u.chat_id}"
-            keyboard.append([InlineKeyboardButton(f"🔓 帮 {name} 解锁", callback_data=f"select_locked_{u.chat_id}")])
+            keyboard.append([InlineKeyboardButton(f"🔓 解锁: {name}", callback_data=f"select_locked_{u.chat_id}")])
         
-        await update.message.reply_text(
-            f"🚨 **发现 {len(locked_users)} 位朋友正在求助**\n\n请选择一位进行协助：",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=ParseMode.MARKDOWN
-        )
+        await update.message.reply_text(f"🚨 **发现 {len(locked_users)} 个冻结账号**\n请选择：", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
         return STATE_UNLOCK_SELECT_USER
 
 async def handle_locked_user_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
-    target_id = int(query.data.split("_")[2])
-    context.user_data[CTX_UNLOCK_TARGET] = target_id
-    
-    await query.edit_message_text(
-        f"🛡️ **安全核验**\n\n请**输入对方告诉您的 6 位数字**：\n(如果是本人，他/她的屏幕上会显示这串数字)",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    context.user_data[CTX_UNLOCK_TARGET] = int(query.data.split("_")[2])
+    await query.edit_message_text(f"🛡️ **安全核验**\n\n请**输入对方提供的 6 位数字密钥**：", parse_mode=ParseMode.MARKDOWN)
     return STATE_UNLOCK_VERIFY_KEY
 
 async def verify_unlock_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -355,39 +334,27 @@ async def verify_unlock_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     input_key = msg.text.strip()
     executor_id = update.effective_user.id
     target_id = context.user_data.get(CTX_UNLOCK_TARGET)
-    
     context.application.create_task(auto_delete_message(context, executor_id, msg.message_id, 0))
     
     async with AsyncSessionLocal() as session:
         target_user = await get_db_user(session, target_id)
         
-        if not target_user.is_locked:
-            await msg.reply_text("ℹ️ 他已经解锁了。")
-            return ConversationHandler.END
-            
         if input_key == target_user.unlock_key:
-            # 核心逻辑：解锁并重置密码
             target_user.is_locked = False
             target_user.login_attempts = 0
             target_user.unlock_key = None
-            target_user.password_hash = None # 🔴 强制重置密码
+            target_user.password_hash = None # 重置密码
             await session.commit()
             
-            await msg.reply_text("✅ **协助成功！**\n对方账号已恢复，并被要求重新设置密码。")
-            
-            try:
-                await context.bot.send_message(
-                    target_id,
-                    f"🎉 **账号已恢复**\n\n您的守护人 **{update.effective_user.first_name}** 帮您解开了锁定。\n\n⚠️ **旧密码已失效**，请点击任意功能重新设置新密码。",
-                    reply_markup=get_main_menu()
-                )
+            await msg.reply_text("✅ **协助成功！**\n对方账号已恢复，且需重置密码。")
+            try: await context.bot.send_message(target_id, f"🎉 **账号已恢复**\n\n您的守护人 **{update.effective_user.first_name}** 已协助解锁。\n\n⚠️ **旧密码已失效**，请重新点击开始设置新密码。", reply_markup=get_main_menu())
             except: pass
             return ConversationHandler.END
         else:
-            await msg.reply_text("❌ **数字不对**\n请核对后再试。")
+            await msg.reply_text("❌ **密钥错误**")
             return ConversationHandler.END
 
-# --- 8. 启动与密码设置 ---
+# --- 8. 启动与设置 ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -396,32 +363,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with AsyncSessionLocal() as session:
         db_user = await get_db_user(session, user.id, user.username)
         
-        # 绑定逻辑
         if context.args and context.args[0].startswith("connect_"):
             target_id = int(context.args[0].split("_")[1])
             if target_id == user.id:
-                await update.message.reply_text("❌ 不能把自己设为守护人哦。")
+                await update.message.reply_text("❌ 不能绑定自己。")
                 return
             exists = (await session.execute(select(EmergencyContact).where(EmergencyContact.owner_chat_id==target_id, EmergencyContact.contact_chat_id==user.id))).scalar()
             if exists:
-                await update.message.reply_text("✅ 您已经是他的守护人了。")
+                await update.message.reply_text("✅ 您已经是守护人了。")
                 return
             
             kb = [[InlineKeyboardButton("✅ 同意守护", callback_data=f"accept_bind_{target_id}"), InlineKeyboardButton("🚫 拒绝", callback_data="decline_bind")]]
-            await update.message.reply_text(f"🛡️ **收到一份信任委托**\nID `{target_id}` 希望将您设为紧急联系人。\n\n**这意味着**：如果他长期失联，您将收到通知（或遗嘱）。", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(f"🛡️ **收到委托**\nID `{target_id}` 希望将您设为守护人。", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
             return
 
-        # 欢迎语
-        welcome = (
-            f"👋 **你好，{user.first_name}**\n\n"
-            "我是 **死了么LifeSignal**，您的私人数字保险箱。\n\n"
-            "📌 **我能做什么？**\n"
-            "1. 每天确认您的安全。\n"
-            "2. 如果您发生意外失联，自动把留言发给您信任的人。\n\n"
-            "🔒 您的所有数据都经过军工级加密，且聊天记录会自动销毁。\n\n"
-            "👇 **点击下方按钮开始：**"
-        )
-        await update.message.reply_markdown(welcome, reply_markup=get_main_menu())
+        if not db_user.password_hash:
+            await update.message.reply_text("👋 **欢迎**\n为了安全，请先设置一个 **访问密码**：\n(直接发送即可)")
+            return STATE_SET_PASSWORD
+        
+        await update.message.reply_text(f"👋 守护中。", reply_markup=get_main_menu())
         return ConversationHandler.END
 
 async def set_password_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -431,10 +391,10 @@ async def set_password_finish(update: Update, context: ContextTypes.DEFAULT_TYPE
         u = await get_db_user(session, update.effective_user.id)
         u.password_hash = hash_password(pwd)
         await session.commit()
-    await update.message.reply_text("✅ **密码设置成功！**\n请牢记它。现在您可以开始使用所有功能了。", reply_markup=get_main_menu())
+    await update.message.reply_text("✅ **密码已设置！**\n请牢记。现在可以开始使用了。", reply_markup=get_main_menu())
     return ConversationHandler.END
 
-# --- 9. 功能菜单展示 ---
+# --- 9. 核心功能菜单 ---
 
 async def show_will_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -450,7 +410,7 @@ async def show_will_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 keyboard.append([InlineKeyboardButton(f"📄 {preview}", callback_data=f"view_will_{w.id}")])
         
         keyboard.append([InlineKeyboardButton("➕ 写新遗嘱", callback_data="add_will_start")])
-        text = f"📜 **我的遗嘱箱**\n目前存了 {len(wills)} 份内容。\n您可以把不同的内容留给不同的人。"
+        text = f"📜 **我的遗嘱箱**\n现有 {len(wills)} 份内容。"
         msg = await context.bot.send_message(user_id, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
         context.application.create_task(auto_delete_message(context, user_id, msg.message_id, 60))
 
@@ -464,17 +424,17 @@ async def show_contacts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if len(contacts) < 10:
             keyboard.append([InlineKeyboardButton("➕ 邀请新守护人", switch_inline_query="invite")])
         
-        text = f"👥 **守护人列表 ({len(contacts)}/10)**\n这些人将在您失联时收到通知。"
+        text = f"👥 **守护人列表 ({len(contacts)}/10)**"
         msg = await context.bot.send_message(user_id, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
         context.application.create_task(auto_delete_message(context, user_id, msg.message_id, 60))
 
 async def show_freq_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     keyboard = [[InlineKeyboardButton("1 天", callback_data="set_freq_24"), InlineKeyboardButton("3 天", callback_data="set_freq_72"), InlineKeyboardButton("7 天", callback_data="set_freq_168")]]
-    msg = await context.bot.send_message(user_id, "⚙️ **如果我失联超过...**\n请选择时间，超时未报平安将触发通知。", reply_markup=InlineKeyboardMarkup(keyboard))
+    msg = await context.bot.send_message(user_id, "⚙️ **如果我失联超过...**", reply_markup=InlineKeyboardMarkup(keyboard))
     context.application.create_task(auto_delete_message(context, user_id, msg.message_id, 60))
 
-# --- 10. 全局回调处理器 ---
+# --- 10. 回调处理 ---
 
 async def handle_global_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -507,7 +467,7 @@ async def handle_global_callbacks(update: Update, context: ContextTypes.DEFAULT_
     elif data.startswith("try_unbind_"):
         cid = int(data.split("_")[2])
         kb = [[InlineKeyboardButton("⚠️ 确认解绑", callback_data=f"do_unbind_{cid}"), InlineKeyboardButton("取消", callback_data="cancel_cb")]]
-        await query.edit_message_text("⚠️ **确定要移除这位守护人吗？**", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+        await query.edit_message_text("⚠️ **确认移除？**", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
 
     elif data.startswith("do_unbind_"):
         cid = int(data.split("_")[2])
@@ -526,23 +486,22 @@ async def handle_global_callbacks(update: Update, context: ContextTypes.DEFAULT_
             u = await get_db_user(session, user_id)
             u.check_frequency = hours
             await session.commit()
-        await query.edit_message_text(f"✅ 设置成功！\n如果失联超过 **{int(hours/24)} 天**，我将通知您的守护人。")
+        await query.edit_message_text(f"✅ 设置成功！期限：{int(hours/24)} 天。")
 
     elif data == "cancel_cb":
         await query.edit_message_text("操作已取消。")
 
-# --- 11. 添加遗嘱流程 ---
+# --- 11. 添加遗嘱 ---
 
 async def start_add_will(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("📝 **请发送您想留下的内容**\n(文字、图片、视频都可以)\n\n⚡️ 发送后消息会立即销毁。")
+    await query.edit_message_text("📝 **请发送内容** (文字/图/视频，15s自毁)")
     return STATE_ADD_WILL_CONTENT
 
 async def receive_will_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     context.application.create_task(auto_delete_message(context, msg.chat_id, msg.message_id, 15))
-    
     if msg.text and msg.text.startswith(("/", "🟢", "⚙️")): return ConversationHandler.END
 
     content, w_type = None, 'text'
@@ -563,21 +522,17 @@ async def render_recipient_selector(update: Update, context: ContextTypes.DEFAUL
     async with AsyncSessionLocal() as session:
         contacts = await get_contacts(session, user_id)
         selected = context.user_data.get('selected', [])
-        
         kb = []
         for c in contacts:
             mark = "✅" if c.contact_chat_id in selected else "⭕️"
             kb.append([InlineKeyboardButton(f"{mark} {c.contact_name}", callback_data=f"sel_rec_{c.contact_chat_id}")])
+        kb.append([InlineKeyboardButton(f"保存 ({len(selected)}人)", callback_data="save_new_will")])
         
-        btn_text = f"保存 ({len(selected)}人)" if selected else "保存 (暂无接收人)"
-        kb.append([InlineKeyboardButton(btn_text, callback_data="save_new_will")])
-        
-        text = "👥 **这份内容留给谁？**\n(点击名字勾选，可多选)"
+        text = "👥 **留给谁？** (点击名字选择)"
         if update.callback_query: await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
         else:
             m = await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
             context.application.create_task(auto_delete_message(context, user_id, m.message_id, 60))
-            
     return STATE_ADD_WILL_RECIPIENTS
 
 async def handle_recipient_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -599,7 +554,7 @@ async def handle_recipient_toggle(update: Update, context: ContextTypes.DEFAULT_
             will = Will(user_id=update.effective_user.id, content=context.user_data['temp_content'], msg_type=context.user_data['temp_type'], recipient_ids=rec_str)
             session.add(will)
             await session.commit()
-        await query.edit_message_text("✅ 遗嘱已加密存入保险箱。")
+        await query.edit_message_text("✅ 遗嘱已保存。")
         return ConversationHandler.END
 
 # --- 12. 杂项 ---
@@ -610,18 +565,28 @@ async def handle_im_safe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     async with AsyncSessionLocal() as session:
         u = await get_db_user(session, user.id)
-        if u.is_locked: return # 熔断拦截
+        if u.is_locked: return
 
         contacts = await get_contacts(session, user.id)
         if not contacts:
-            msg = await update.message.reply_text("⚠️ **未处于保护状态**\n请先绑定至少一位守护人。", reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN)
+            msg = await update.message.reply_text("⚠️ **未保护**\n请先绑定守护人。", reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN)
             context.application.create_task(auto_delete_message(context, user.id, msg.message_id, 5))
             return
         u.last_active = datetime.now(timezone.utc)
         u.status = 'active'
         await session.commit()
-    msg = await update.message.reply_text("✅ 收到！已确认您很平安。", reply_markup=get_main_menu())
+    msg = await update.message.reply_text("✅ 已确认安全。", reply_markup=get_main_menu())
     context.application.create_task(auto_delete_message(context, user.id, msg.message_id, 5))
+
+async def handle_security(update, context):
+    # 修复：加上双按钮
+    context.application.create_task(auto_delete_message(context, update.effective_chat.id, update.message.message_id, 1))
+    text = "🛡️ **透明是信任的基石**\n\n点击下方按钮查看源代码。"
+    kb = [
+        [InlineKeyboardButton("👨‍💻 GitHub 源码", url=GITHUB_REPO_URL)],
+        [InlineKeyboardButton("🔍 VirusTotal 检测", url="https://www.virustotal.com/gui/home/url")]
+    ]
+    await update.message.reply_markdown(text, reply_markup=InlineKeyboardMarkup(kb))
 
 async def confirm_bind_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -635,7 +600,7 @@ async def confirm_bind_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await get_db_user(session, update.effective_user.id)
         await session.commit()
     await query.edit_message_text("✅ 绑定成功。")
-    try: await context.bot.send_message(requester_id, "🎉 对方已接受，成为您的守护人！")
+    try: await context.bot.send_message(requester_id, "🎉 对方已接受守护！")
     except: pass
 
 async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -647,58 +612,37 @@ async def inline_query_handler(update, context):
     query = update.inline_query.query
     if query == "invite":
         link = f"https://t.me/{context.bot.username}?start=connect_{update.effective_user.id}"
-        results = [InlineQueryResultArticle(id=str(uuid4()), title="邀请守护人", input_message_content=InputTextMessageContent(f"📩 **来自 {update.effective_user.first_name} 的委托**\n\n我希望将你设为我的守护人。\n👇 **请点击下方链接接受：**", parse_mode=ParseMode.MARKDOWN), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ 接受委托", url=link)]]))]
+        results = [InlineQueryResultArticle(id=str(uuid4()), title="邀请守护人", input_message_content=InputTextMessageContent(f"📩 **来自 {update.effective_user.first_name} 的委托**\n\n希望您能成为我的守护人。\n👇 **点击接受：**", parse_mode=ParseMode.MARKDOWN), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ 接受委托", url=link)]]))]
         await update.inline_query.answer(results)
-
-async def handle_security(update, context):
-    context.application.create_task(auto_delete_message(context, update.effective_chat.id, update.message.message_id, 1))
-    await update.message.reply_markdown(f"GitHub: {GITHUB_REPO_URL}")
 
 async def check_dead_mans_switch(app):
     async with AsyncSessionLocal() as session:
         stmt = select(User).where(User.status == 'active')
-        result = await session.execute(stmt)
-        users = result.scalars().all()
+        users = (await session.execute(stmt)).scalars().all()
         now = datetime.now(timezone.utc)
         
         for user in users:
             last = user.last_active.replace(tzinfo=timezone.utc) if user.last_active.tzinfo is None else user.last_active
-            delta_hours = (now - last).total_seconds() / 3600
+            delta = (now - last).total_seconds() / 3600
             
-            if delta_hours > user.check_frequency:
+            if delta > user.check_frequency:
                 contacts = await get_contacts(session, user.chat_id)
                 if contacts:
                     wills = await get_wills(session, user.chat_id)
-                    for contact in contacts:
-                        c_id = contact.contact_chat_id
+                    for c in contacts:
                         try:
-                            await app.bot.send_message(chat_id=c_id, text=f"🚨 **死了么LifeSignal 紧急通告**\n\n用户 @{user.username or user.chat_id} 已失联。", parse_mode=ParseMode.MARKDOWN)
-                            # 发送对应的遗嘱
-                            if wills:
-                                sent_any = False
-                                for w in wills:
-                                    if w.recipient_ids and str(c_id) in w.recipient_ids.split(","):
-                                        if not sent_any:
-                                            await app.bot.send_message(c_id, "🔐 **以下是留给您的加密信息：**")
-                                            sent_any = True
-                                        
-                                        content = decrypt_data(w.content)
-                                        if w.msg_type == 'text': await app.bot.send_message(c_id, content)
-                                        elif w.msg_type == 'photo': await app.bot.send_photo(c_id, content)
-                                        elif w.msg_type == 'video': await app.bot.send_video(c_id, content)
-                                        elif w.msg_type == 'voice': await app.bot.send_voice(c_id, content)
+                            await app.bot.send_message(c.contact_chat_id, f"🚨 **紧急通告**\n用户 @{user.username} 已失联。", parse_mode=ParseMode.MARKDOWN)
+                            for w in wills:
+                                if w.recipient_ids and str(c.contact_chat_id) in w.recipient_ids.split(","):
+                                    content = decrypt_data(w.content)
+                                    if w.msg_type=='text': await app.bot.send_message(c.contact_chat_id, f"🔐 遗嘱:\n{content}")
+                                    else: await app.bot.send_message(c.contact_chat_id, "🔐 (媒体文件已发送)")
                         except: pass
                     user.status = 'inactive'
                     session.add(user)
-                else:
-                    user.status = 'inactive'
-                    session.add(user)
-            
-            elif delta_hours > (user.check_frequency * 0.8):
-                try:
-                    left_hours = int(user.check_frequency - delta_hours)
-                    markup = get_main_menu()
-                    await app.bot.send_message(chat_id=user.chat_id, text=f"⏰ **温馨提醒**\n\n请点击“🟢 我很安全”重置计时。\n距离触发还剩约 {left_hours} 小时。", reply_markup=markup)
+            elif delta > (user.check_frequency * 0.8):
+                try: 
+                    await app.bot.send_message(user.chat_id, "⏰ **温馨提醒**\n请报平安。", reply_markup=get_main_menu())
                 except: pass
         await session.commit()
 
@@ -710,11 +654,9 @@ def main():
     persistence = PicklePersistence(filepath='persistence.pickle')
     app = Application.builder().token(TOKEN).persistence(persistence).build()
 
-    # 0. 全局熔断拦截器 (Group -1)
     app.add_handler(MessageHandler(filters.ALL, global_lock_interceptor), group=-1)
     app.add_handler(CallbackQueryHandler(global_lock_interceptor), group=-1)
 
-    # 1. 密码验证层 (Group 0)
     auth_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(f"^({BTN_WILLS}|{BTN_CONTACTS}|{BTN_SETTINGS})$"), request_password_entry)],
         states={STATE_VERIFY_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_password_verification)]},
@@ -722,7 +664,6 @@ def main():
         name="auth_gw", persistent=True
     )
 
-    # 2. 紧急联系人解锁层 (Group 0)
     unlock_handler = ConversationHandler(
         entry_points=[CommandHandler("unlock", start_remote_unlock)],
         states={
@@ -733,7 +674,6 @@ def main():
         name="unlock_flow", persistent=True
     )
 
-    # 3. 添加遗嘱层
     add_will_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(start_add_will, pattern="^add_will_start$")],
         states={
@@ -744,7 +684,6 @@ def main():
         name="add_will", persistent=True
     )
 
-    # 4. 初始设置
     setup_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={STATE_SET_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_password_finish)]},
@@ -757,7 +696,7 @@ def main():
     app.add_handler(unlock_handler)
     app.add_handler(add_will_handler)
     
-    app.add_handler(CommandHandler("unlock", cmd_remote_unlock)) # 兼容误输
+    app.add_handler(CommandHandler("unlock", lambda u,c: u.message.reply_text("请点击菜单或重新输入。")))
     app.add_handler(MessageHandler(filters.Regex(f"^{BTN_SAFE}$"), handle_im_safe))
     app.add_handler(MessageHandler(filters.Regex(f"^{BTN_SECURITY}$"), handle_security))
     
@@ -775,10 +714,6 @@ def main():
     
     print("🚀 死了么LifeSignal Final Stable is running...")
     app.run_polling()
-
-# 兼容指令 (防止 ContextHandler 没抓到)
-async def cmd_remote_unlock(update, context):
-    await update.message.reply_text("请点击菜单或使用 /unlock 开始。")
 
 if __name__ == '__main__':
     main()

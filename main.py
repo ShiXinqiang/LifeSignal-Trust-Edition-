@@ -2,6 +2,7 @@ import os
 import logging
 import asyncio
 import urllib.parse
+from uuid import uuid4 
 from datetime import datetime, timedelta, timezone
 
 # Telegram 相关库
@@ -9,13 +10,16 @@ from telegram import (
     Update, 
     ReplyKeyboardMarkup, 
     InlineKeyboardMarkup, 
-    InlineKeyboardButton
+    InlineKeyboardButton,
+    InlineQueryResultArticle, 
+    InputTextMessageContent   
 )
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    InlineQueryHandler, 
     ContextTypes,
     filters,
     ConversationHandler,
@@ -45,14 +49,11 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "LifeSignal_Bot") 
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY") 
-# 项目地址
 GITHUB_REPO_URL = "https://github.com/ShiXinqiang/LifeSignal-Trust-Edition-" 
 
-# 检查关键变量
 if not TOKEN or not DATABASE_URL:
     raise ValueError("❌ 启动失败: 缺少 TELEGRAM_BOT_TOKEN 或 DATABASE_URL")
 
-# 处理加密密钥
 if not ENCRYPTION_KEY:
     logger.warning("⚠️以此模式运行不安全！未检测到 ENCRYPTION_KEY，正在使用临时密钥。")
     ENCRYPTION_KEY = Fernet.generate_key().decode()
@@ -90,7 +91,7 @@ class User(Base):
 engine = create_async_engine(DATABASE_URL, echo=False)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
-# --- 3. 辅助函数 (安全与工具) ---
+# --- 3. 辅助函数 ---
 
 def encrypt_data(data: str) -> str:
     """AES 加密"""
@@ -106,7 +107,7 @@ def decrypt_data(encrypted_data: str) -> str:
         return "[数据无法解密：密钥可能已更改]"
 
 async def auto_delete_message(context, chat_id, message_id, delay=3):
-    """消息自动销毁 (UX优化)"""
+    """消息自动销毁"""
     await asyncio.sleep(delay)
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
@@ -125,18 +126,17 @@ async def get_db_user(session, chat_id, username=None):
         user.username = username
     return user
 
-# --- 4. UI 界面定义 (修复点：恢复全局常量) ---
+# --- 4. UI 界面定义 (全局常量定义区) ---
 
-# ✅ 这里定义全局常量，确保 main() 函数能读取到
+# ✅ 定义在最外层，保证全局可见，修复 NameError
 BTN_SAFE = "🟢 我很安全"
 BTN_BIND = "🤝 绑定联系人"
 BTN_SECURITY = "🛡️ 开源验证"
 
 def get_main_menu(user_obj) -> ReplyKeyboardMarkup:
     """
-    根据用户状态动态生成键盘文字
+    生成底部常驻菜单
     """
-    # 动态判断按钮文字
     if user_obj and user_obj.will_content:
         btn_setup = "⚙️ 设置/重置遗嘱"
     else:
@@ -149,7 +149,7 @@ def get_main_menu(user_obj) -> ReplyKeyboardMarkup:
             [BTN_SECURITY]
         ],
         resize_keyboard=True,
-        is_persistent=True, 
+        is_persistent=True, # 强制常驻
         input_field_placeholder="死了么LifeSignal 正在守护..."
     )
 
@@ -158,17 +158,16 @@ STATE_CHECK_EXISTING, STATE_CHOOSE_FREQ, STATE_UPLOAD_WILL, STATE_CONFIRM = rang
 # --- 5. 交互逻辑 ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """启动与深度链接处理"""
+    """启动逻辑"""
     user = update.effective_user
     args = context.args
     
     async with AsyncSessionLocal() as session:
         db_user = await get_db_user(session, user.id, user.username)
         await session.commit()
-        
-        # 获取动态键盘
         menu_markup = get_main_menu(db_user)
 
+        # 处理“接受委托”的深度链接
         if args and args[0].startswith("connect_"):
             target_id = int(args[0].split("_")[1])
             if target_id == user.id:
@@ -199,7 +198,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_markdown(welcome_text, reply_markup=menu_markup)
 
 async def handle_security(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理 '🛡️ 开源验证'"""
+    """开源验证"""
     text = (
         "🛡️ **透明是信任的基石**\n\n"
         "**死了么LifeSignal** 致力于提供最安全的数字遗嘱服务。为了证明这一点，我们将项目代码完全开源。\n\n"
@@ -215,70 +214,61 @@ async def handle_security(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_markdown(text, reply_markup=InlineKeyboardMarkup(keyboard), disable_web_page_preview=True)
 
-# --- 遗嘱设置流程 (Conversation) ---
+# --- 遗嘱设置流程 ---
 
 async def setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 0: 检查是否存在旧遗嘱"""
     user_id = update.effective_user.id
-    
     async with AsyncSessionLocal() as session:
         user = await get_db_user(session, user_id)
         has_will = bool(user.will_content)
     
-    # 动态提示：如果已有遗嘱，警告覆盖
     if has_will:
         keyboard = [
             [InlineKeyboardButton("⚠️ 覆盖并重新设置", callback_data="overwrite_yes")],
             [InlineKeyboardButton("🚫 取消，保留原状", callback_data="overwrite_no")]
         ]
         await update.message.reply_text(
-            "⚠️ **检测到您已设置过遗嘱**\n\n"
-            "继续操作将导致**旧的遗嘱内容被永久删除**且无法恢复。\n\n"
-            "您确定要重新设置吗？",
+            "⚠️ **检测到您已设置过遗嘱**\n\n继续操作将导致**旧的遗嘱内容被永久删除**且无法恢复。\n您确定要重新设置吗？",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.MARKDOWN
         )
         return STATE_CHECK_EXISTING
     else:
-        # 新用户直接开始
         return await ask_frequency_step(update, context)
 
 async def setup_overwrite_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 0.5: 处理覆盖决策"""
     query = update.callback_query
     await query.answer()
     
     if query.data == "overwrite_no":
-        await query.edit_message_text("✅ 操作已取消，您的旧遗嘱非常安全。")
+        user_id = update.effective_user.id
+        async with AsyncSessionLocal() as session:
+            db_user = await get_db_user(session, user_id)
+            markup = get_main_menu(db_user)
+        await query.message.reply_text("✅ 操作已取消。", reply_markup=markup)
         return ConversationHandler.END
     
     if query.data == "overwrite_yes":
         return await ask_frequency_step(update, context, is_callback=True)
 
 async def ask_frequency_step(update: Update, context: ContextTypes.DEFAULT_TYPE, is_callback=False):
-    """辅助函数：发送频率选择卡片"""
     keyboard = [[
         InlineKeyboardButton("1 天", callback_data="day_1"),
         InlineKeyboardButton("3 天 (推荐)", callback_data="day_3"),
         InlineKeyboardButton("7 天", callback_data="day_7"),
     ]]
     text = "⚙️ **步骤 1/2：选择确认周期**\n\n请问如果我联系不上您超过多少**天**，就视为触发条件？"
-    
     if is_callback:
         await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
     else:
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-        
     return STATE_CHOOSE_FREQ
 
 async def setup_freq_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 2: 确认时间，提示录入"""
     query = update.callback_query
     await query.answer()
-    
     days = int(query.data.split("_")[1])
-    hours = days * 24
-    context.user_data['temp_freq'] = hours
+    context.user_data['temp_freq'] = days * 24
     
     await query.edit_message_text(f"✅ 频率已设定为：**{days} 天**", parse_mode=ParseMode.MARKDOWN)
     
@@ -292,10 +282,8 @@ async def setup_freq_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return STATE_UPLOAD_WILL
 
 async def setup_receive_will(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 3: 接收并加密内容"""
     msg = update.message
-    # 防误触：检测到底部菜单文字直接退出
-    # 这里使用 regex pattern 匹配所有可能的按钮开头
+    # 防误触逻辑
     if msg.text and msg.text.startswith(("🟢", "⚙️", "🤝", "🛡️")):
         user_id = update.effective_user.id
         async with AsyncSessionLocal() as session:
@@ -306,7 +294,6 @@ async def setup_receive_will(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     content = None
     w_type = 'text'
-    
     if msg.text:
         content = encrypt_data(msg.text)
         w_type = 'text'
@@ -315,7 +302,6 @@ async def setup_receive_will(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if msg.photo: raw_file_id = msg.photo[-1].file_id
         elif msg.video: raw_file_id = msg.video.file_id
         elif msg.voice: raw_file_id = msg.voice.file_id
-        
         content = encrypt_data(raw_file_id) 
         if msg.photo: w_type = 'photo'
         elif msg.video: w_type = 'video'
@@ -325,7 +311,6 @@ async def setup_receive_will(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return STATE_UPLOAD_WILL
 
     context.user_data.update({'temp_content': content, 'temp_type': w_type})
-    
     keyboard = [[
         InlineKeyboardButton("✅ 确认加密保存", callback_data="confirm_yes"),
         InlineKeyboardButton("🔄 重新编辑", callback_data="confirm_retry")
@@ -334,17 +319,15 @@ async def setup_receive_will(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return STATE_CONFIRM
 
 async def setup_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 4: 写入数据库"""
     query = update.callback_query
     await query.answer()
+    user_id = update.effective_user.id
     
     if query.data == "confirm_retry":
         await query.edit_message_text("已取消，请重新发送。")
         return ConversationHandler.END
 
-    user_id = update.effective_user.id
     d = context.user_data
-    
     async with AsyncSessionLocal() as session:
         user = await get_db_user(session, user_id)
         user.check_frequency = d['temp_freq']
@@ -366,7 +349,6 @@ async def setup_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=user_id, text="👇 建议立即绑定", reply_markup=new_menu)
     else:
         await context.bot.send_message(chat_id=user_id, text="👇 您的守护程序已就绪", reply_markup=new_menu)
-        
     return ConversationHandler.END
 
 async def cancel_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -377,16 +359,15 @@ async def cancel_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("操作已取消。", reply_markup=markup)
     return ConversationHandler.END
 
-# --- 常规功能 ---
+# --- 报平安逻辑 ---
 
 async def handle_im_safe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """报平安 - 智能状态检测"""
     user = update.effective_user
-    
     async with AsyncSessionLocal() as session:
         db_user = await get_db_user(session, user.id)
-        
-        # 🚨 状态检测
+        markup = get_main_menu(db_user)
+
+        # 状态检测
         if not db_user.will_content or not db_user.emergency_contact_id:
             missing = []
             if not db_user.will_content: missing.append("未设置遗嘱")
@@ -399,42 +380,67 @@ async def handle_im_safe(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "如果现在发生意外，**系统将无法执行任何操作**。\n"
                 "请务必完成下方设置 👇"
             )
-            markup = get_main_menu(db_user)
             await update.message.reply_text(alert_text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
             return
 
         db_user.last_active = datetime.now(timezone.utc)
         db_user.status = 'active'
         await session.commit()
-        markup = get_main_menu(db_user)
     
     msg = await update.message.reply_text("✅ 已确认！守护倒计时已重置。", reply_markup=markup)
     context.application.create_task(auto_delete_message(context, user.id, msg.message_id))
 
+# --- 绑定与内联邀请逻辑 (核心升级) ---
+
 async def handle_bind_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """生成绑定链接 - 增加一键转发按钮"""
-    user = update.effective_user
-    bot_username = context.bot.username
-    invite_link = f"https://t.me/{bot_username}?start=connect_{user.id}"
-    
-    # 构造 Telegram 原生分享链接
-    share_text = f"📩 来自 {user.first_name} 的信任委托\n我正在使用 死了么LifeSignal 服务，希望将你设为我的紧急联系人。"
-    encoded_text = urllib.parse.quote(share_text)
-    encoded_url = urllib.parse.quote(invite_link)
-    share_deep_link = f"https://t.me/share/url?url={encoded_url}&text={encoded_text}"
+    """引导使用内联模式发送"""
+    # 这里我们使用 switch_inline_query 参数
+    # 用户点击后，输入框会自动填入 @BotName invite
+    keyboard = [[
+        InlineKeyboardButton("🚀 选择好友发送邀请", switch_inline_query="invite")
+    ]]
     
     text = (
         "🤝 **绑定紧急联系人**\n\n"
-        "为了确保安全，必须由对方亲自确认接受委托。\n\n"
-        "👇 **点击下方按钮，直接选择好友发送邀请：**"
+        "请点击下方按钮，选择您信任的好友（如亲属、挚友）。\n"
+        "发送邀请卡片后，对方点击“✅ 接受委托”即可完成绑定。"
     )
-    
-    keyboard = [[InlineKeyboardButton("🚀 一键转发给联系人", url=share_deep_link)]]
     
     await update.message.reply_markdown(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
+async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理内联查询"""
+    query = update.inline_query.query
+    user = update.effective_user
+
+    if query == "invite":
+        bot_username = context.bot.username
+        invite_link = f"https://t.me/{bot_username}?start=connect_{user.id}"
+        
+        title = "发送遗嘱委托邀请"
+        description = f"邀请对方成为您的紧急联系人"
+        message_text = (
+            f"📩 **来自 {user.first_name} 的信任委托**\n\n"
+            "我正在使用 **死了么LifeSignal** 服务。\n"
+            "我希望将你设为我的紧急联系人。\n\n"
+            "如果我发生意外失联，机器人会将我留下的加密信息发送给你。\n"
+            "👇 **请点击下方链接接受委托：**"
+        )
+        
+        keyboard = [[InlineKeyboardButton("✅ 点击接受委托", url=invite_link)]]
+        
+        results = [
+            InlineQueryResultArticle(
+                id=str(uuid4()),
+                title=title,
+                description=description,
+                input_message_content=InputTextMessageContent(message_text, parse_mode=ParseMode.MARKDOWN),
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        ]
+        await update.inline_query.answer(results, cache_time=0)
+
 async def confirm_bind_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理联系人接受绑定"""
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -449,7 +455,7 @@ async def confirm_bind_callback(update: Update, context: ContextTypes.DEFAULT_TY
         req = await get_db_user(session, requester_id)
         req.emergency_contact_id = executor.id
         req.emergency_contact_name = executor.first_name
-        await get_db_user(session, executor.id) # 确保联系人入库
+        await get_db_user(session, executor.id)
         await session.commit()
     
     await query.edit_message_text(f"✅ 绑定成功！您已成为 ID {requester_id} 的守护者。")
@@ -460,7 +466,6 @@ async def confirm_bind_callback(update: Update, context: ContextTypes.DEFAULT_TY
 # --- 后台定时任务 ---
 
 async def check_dead_mans_switch(app: Application):
-    """检查活跃状态并触发遗嘱"""
     async with AsyncSessionLocal() as session:
         stmt = select(User).where(User.status == 'active')
         result = await session.execute(stmt)
@@ -476,13 +481,11 @@ async def check_dead_mans_switch(app: Application):
                 if contact_id:
                     try:
                         decrypted_content = decrypt_data(user.will_content)
-                        
                         await app.bot.send_message(
                             chat_id=contact_id,
                             text=f"🚨 **死了么LifeSignal 紧急触发**\n\n用户 @{user.username or user.chat_id} 已超过设定时间未报平安。\n以下是解密后的信息：",
                             parse_mode=ParseMode.MARKDOWN
                         )
-                        
                         if user.will_type == 'text':
                             await app.bot.send_message(contact_id, decrypted_content)
                         elif user.will_type == 'photo':
@@ -491,7 +494,6 @@ async def check_dead_mans_switch(app: Application):
                             await app.bot.send_video(contact_id, decrypted_content)
                         elif user.will_type == 'voice':
                             await app.bot.send_voice(contact_id, decrypted_content)
-                            
                         user.status = 'inactive'
                         session.add(user)
                     except Exception as e:
@@ -525,7 +527,6 @@ def main():
     app = Application.builder().token(TOKEN).persistence(persistence).build()
 
     setup_conv = ConversationHandler(
-        # 优化正则：同时匹配“设置遗嘱”和“设置/重置遗嘱”
         entry_points=[MessageHandler(filters.Regex(r"^⚙️ 设置.*遗嘱$"), setup_start)],
         states={
             STATE_CHECK_EXISTING: [CallbackQueryHandler(setup_overwrite_decision, pattern="^overwrite_")],
@@ -533,7 +534,7 @@ def main():
             STATE_UPLOAD_WILL: [MessageHandler(filters.ALL & ~filters.COMMAND & ~filters.Regex("^(🟢|⚙️|🤝|🛡️)"), setup_receive_will)],
             STATE_CONFIRM: [CallbackQueryHandler(setup_confirm, pattern="^confirm_")]
         },
-        # ✅ 这里现在可以正常读取全局的 BTN_SAFE 了
+        # ✅ 正确使用全局变量 BTN_SAFE
         fallbacks=[CommandHandler("cancel", cancel_setup), MessageHandler(filters.Regex(f"^{BTN_SAFE}$"), cancel_setup)],
         name="setup_conversation", persistent=True
     )
@@ -545,6 +546,9 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(f"^{BTN_SECURITY}$"), handle_security))
     app.add_handler(CallbackQueryHandler(confirm_bind_callback, pattern="^accept_bind_"))
     app.add_handler(CallbackQueryHandler(confirm_bind_callback, pattern="^decline_bind"))
+    
+    # ✅ 注册内联处理器
+    app.add_handler(InlineQueryHandler(inline_query_handler))
 
     loop = asyncio.get_event_loop()
     loop.run_until_complete(init_db())

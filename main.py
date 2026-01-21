@@ -208,7 +208,7 @@ async def global_lock_interceptor(update: Update, context: ContextTypes.DEFAULT_
                     "如何解锁？\n"
                     "1. 请联系您的守护人（您绑定的紧急联系人）。\n"
                     f"2. 把这个【恢复密钥】发给他： {key_display}\n"
-                    "3. 他输入密钥后，您的账户就会立刻恢复。"
+                    "3. 他输入/unlock再输入密钥，您的账户就会立刻恢复。"
                 )
                 if update.message:
                     msg = await update.message.reply_text(alert)

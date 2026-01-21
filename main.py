@@ -192,6 +192,8 @@ async def get_wills(session, user_id):
 async def global_lock_interceptor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user: return
+    
+    # 自动删除用户发的消息（保持界面整洁）
     if update.message:
         context.application.create_task(auto_delete_message(context, user.id, update.message.message_id, 1))
 
@@ -269,10 +271,19 @@ async def handle_password_verification(update: Update, context: ContextTypes.DEF
                 context.application.create_task(auto_delete_message(context, user_id, retry_msg.message_id, 5))
                 return STATE_VERIFY_PASSWORD
 
-# --- 6. 守护人解锁流程 ---
+# --- 6. 守护人解锁流程 (已修复) ---
 
 async def start_remote_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    1. 守护人输入 /unlock
+    2. 系统查找他守护了哪些人，且哪些人是被锁定的
+    3. 显示按钮列表
+    """
     executor_id = update.effective_user.id
+    
+    # 立即删除 /unlock 指令
+    context.application.create_task(auto_delete_message(context, executor_id, update.message.message_id, 1))
+
     async with AsyncSessionLocal() as session:
         stmt = select(EmergencyContact).where(EmergencyContact.contact_chat_id == executor_id)
         entrustments = (await session.execute(stmt)).scalars().all()
@@ -284,7 +295,7 @@ async def start_remote_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         if not locked_users:
             msg = await update.message.reply_text("✅ 您守护的人目前都很安全，没有账户被冻结。")
-            context.application.create_task(auto_delete_message(context, executor_id, msg.message_id, 5))
+            context.application.create_task(auto_delete_message(context, executor_id, msg.message_id, 10))
             return ConversationHandler.END
         
         kb = [[InlineKeyboardButton(f"🔓 解锁: {u.username or u.chat_id}", callback_data=f"select_locked_{u.chat_id}")] for u in locked_users]
@@ -292,32 +303,56 @@ async def start_remote_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE
         return STATE_UNLOCK_SELECT_USER
 
 async def handle_locked_user_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    点击选择用户按钮后的处理
+    """
     query = update.callback_query
     await query.answer()
-    context.user_data[CTX_UNLOCK_TARGET] = int(query.data.split("_")[2])
-    await query.edit_message_text("🛡️ 请输入对方告诉您的【6位恢复密钥】：")
+    
+    # 解析 callback data: select_locked_12345
+    target_id = int(query.data.split("_")[2])
+    context.user_data[CTX_UNLOCK_TARGET] = target_id
+    
+    await query.edit_message_text(
+        "🛡️ 请输入对方告诉您的【6位恢复密钥】：\n\n"
+        "（只有填对密钥，才能证明您确实收到了他的求助）"
+    )
     return STATE_UNLOCK_VERIFY_KEY
 
 async def verify_unlock_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    验证密钥并解锁
+    """
     msg = update.message
     input_key = msg.text.strip()
     target_id = context.user_data.get(CTX_UNLOCK_TARGET)
     
+    # 删除密钥消息
+    context.application.create_task(auto_delete_message(context, update.effective_user.id, msg.message_id, 1))
+    
     async with AsyncSessionLocal() as session:
         target_user = await get_db_user(session, target_id)
+        
         if input_key == target_user.unlock_key:
             target_user.is_locked = False
             target_user.login_attempts = 0
             target_user.unlock_key = None
-            target_user.password_hash = None
+            target_user.password_hash = None # 强制重置密码
             await session.commit()
+            
             await msg.reply_text("✅ 操作成功！对方的账户已解锁，并被强制要求重置密码。")
-            try: await context.bot.send_message(target_id, "🎉 账户已恢复！\n您的守护人已帮您解锁。由于原密码可能泄露，请重新设置一个新密码。", reply_markup=get_main_menu())
+            try: 
+                await context.bot.send_message(
+                    target_id, 
+                    "🎉 账户已恢复！\n您的守护人已帮您解锁。由于原密码可能泄露，请重新设置一个新密码。", 
+                    reply_markup=get_main_menu()
+                )
             except: pass
             return ConversationHandler.END
         else:
-            await msg.reply_text("❌ 密钥不对，请重新核对。")
-            return ConversationHandler.END
+            fail_msg = await msg.reply_text("❌ 密钥不对，请重新核对。")
+            context.application.create_task(auto_delete_message(context, update.effective_user.id, fail_msg.message_id, 10))
+            return ConversationHandler.END # 也可以选择不END，允许重试，这里END简单点
 
 # --- 7. 基础功能 ---
 
@@ -407,7 +442,7 @@ async def show_contacts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def show_freq_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     kb = [[InlineKeyboardButton("24小时", callback_data="set_freq_24"), InlineKeyboardButton("3天", callback_data="set_freq_72"), InlineKeyboardButton("7天", callback_data="set_freq_168")]]
-    msg = await context.bot.send_message(user_id, "⏱️ 调整失联判定时间\n\n如果你超过这个时间没来【确认平安】，系统就会判定你失联了。", reply_markup=InlineKeyboardMarkup(kb))
+    msg = await context.bot.send_message(user_id, "⏱️ 调整失联判定时间\n\n如果你超过这个时间没来【确认平安】，系统就会判定你失联了，从而发出警报和遗嘱信。", reply_markup=InlineKeyboardMarkup(kb))
     context.application.create_task(auto_delete_message(context, user_id, msg.message_id, 60))
 
 # --- 9. 核心交互回调处理 ---
@@ -755,18 +790,27 @@ def main():
     app.add_handler(MessageHandler(filters.ALL, global_lock_interceptor), group=-1)
     app.add_handler(CallbackQueryHandler(global_lock_interceptor), group=-1)
 
+    # 1. 解锁流程 (放在前面)
+    # 修复：给CallbackQueryHandler增加了精确的 pattern，确保能抓住 "select_locked_" 开头的按钮
+    unlock_handler = ConversationHandler(
+        entry_points=[CommandHandler("unlock", start_remote_unlock)],
+        states={
+            STATE_UNLOCK_SELECT_USER: [CallbackQueryHandler(handle_locked_user_selection, pattern="^select_locked_")], 
+            STATE_UNLOCK_VERIFY_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, verify_unlock_key)]
+        },
+        fallbacks=[CommandHandler("cancel", cancel_action)], 
+        name="unlock", 
+        persistent=True
+    )
+
+    # 2. 密码验证流程
     auth_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Text([BTN_WILLS, BTN_CONTACTS, BTN_SETTINGS]), request_password_entry)],
         states={STATE_VERIFY_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_password_verification)]},
         fallbacks=[CommandHandler("cancel", cancel_action)], name="auth_gw", persistent=True
     )
 
-    unlock_handler = ConversationHandler(
-        entry_points=[CommandHandler("unlock", start_remote_unlock)],
-        states={STATE_UNLOCK_SELECT_USER: [CallbackQueryHandler(handle_locked_user_selection)], STATE_UNLOCK_VERIFY_KEY: [MessageHandler(filters.TEXT, verify_unlock_key)]},
-        fallbacks=[CommandHandler("cancel", cancel_action)], name="unlock", persistent=True
-    )
-
+    # 3. 添加信件流程
     add_will_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(start_add_will, pattern="^add_will_start$")],
         states={STATE_ADD_WILL_CONTENT: [MessageHandler(filters.ALL & ~filters.COMMAND, receive_will_content)], STATE_ADD_WILL_RECIPIENTS: [CallbackQueryHandler(handle_recipient_toggle)]},
@@ -774,13 +818,17 @@ def main():
     )
 
     app.add_handler(ConversationHandler(entry_points=[CommandHandler("start", start)], states={STATE_SET_PASSWORD: [MessageHandler(filters.TEXT, set_password_finish)]}, fallbacks=[], name="setup"))
-    app.add_handler(auth_handler)
+    
+    # 注册 Handler
     app.add_handler(unlock_handler)
+    app.add_handler(auth_handler)
     app.add_handler(add_will_handler)
     
+    # 快捷按钮
     app.add_handler(MessageHandler(filters.Text(BTN_SAFE), handle_im_safe))
     app.add_handler(MessageHandler(filters.Text(BTN_SECURITY), handle_security))
     
+    # 全局回调
     app.add_handler(CallbackQueryHandler(handle_global_callbacks, pattern="^(menu_|view_|reveal_|del_|try_|do_|set_freq_|edit_|tgl_|save_|cancel)"))
     app.add_handler(CallbackQueryHandler(confirm_bind_callback, pattern="^accept_bind_"))
     app.add_handler(InlineQueryHandler(inline_query_handler))
@@ -792,7 +840,7 @@ def main():
     scheduler.add_job(check_dead_mans_switch, 'interval', minutes=30, args=[app])
     scheduler.start()
     
-    print("🚀 死了么LifeSignal Final Polish is running...")
+    print("🚀 死了么LifeSignal Final Stable is running...")
     app.run_polling()
 
 if __name__ == '__main__':
